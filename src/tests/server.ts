@@ -2,7 +2,11 @@ import fastify, { FastifyInstance } from 'fastify'
 import keycloak, { KeycloakOptions } from '../keycloak'
 
 const startFastify = async (port: number, keycloakOptions: KeycloakOptions) => {
-  const server: FastifyInstance = fastify()
+  const server: FastifyInstance = fastify({
+    logger: {
+      level: 'debug'
+    }
+  })
 
   server.get('/ping', async (request, reply) => {
     return reply.status(200).send({ msg: 'pong' })

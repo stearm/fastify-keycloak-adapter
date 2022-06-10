@@ -2,7 +2,6 @@ import fastifyPlugin from 'fastify-plugin'
 import cookie from '@fastify/cookie'
 import session from '@fastify/session'
 import grant, { GrantResponse, GrantSession } from 'grant'
-import jwt from '@fastify/jwt'
 import { FastifyRequest, FastifyReply, FastifyInstance } from 'fastify'
 import * as B from 'fp-ts/boolean'
 import * as E from 'fp-ts/Either'
@@ -10,25 +9,14 @@ import * as O from 'fp-ts/Option'
 import * as TE from 'fp-ts/TaskEither'
 import { pipe } from 'fp-ts/function'
 import { inspect } from 'util'
-import axios from 'axios'
 import wcmatch from 'wildcard-match'
+import { Issuer, IntrospectionResponse } from 'openid-client'
 
 declare module 'fastify' {
   interface Session {
     grant: GrantSession
     user: unknown
   }
-}
-
-type WellKnownConfiguration = {
-  authorization_endpoint: string
-  token_endpoint: string
-  end_session_endpoint: string
-}
-
-type RealmResponse = {
-  realm: string
-  public_key: string
 }
 
 export type UserInfo = {
@@ -52,94 +40,43 @@ export type KeycloakOptions = {
 }
 
 export default fastifyPlugin(async (fastify: FastifyInstance, opts: KeycloakOptions) => {
-  function getWellKnownConfiguration(url: string) {
-    return TE.tryCatch(
-      () => axios.get<WellKnownConfiguration>(url),
-      (e) => new Error(`Failed to get openid configuration: ${e}`)
-    )
-  }
-
   const protocol = opts.useHttps ? 'https://' : 'http://'
 
-  const keycloakConfiguration = await pipe(
-    `${protocol}${opts.keycloakSubdomain}/.well-known/openid-configuration`,
-    getWellKnownConfiguration,
-    TE.map((response) => response.data)
-  )()
+  const keycloakUrl = `${protocol}${opts.keycloakSubdomain}`
 
-  function registerDependentPlugin(config: WellKnownConfiguration) {
-    fastify.register(cookie)
+  const grantUrl = `${opts.appOrigin}/connect/keycloak`
 
-    fastify.register(session, {
-      secret: new Array(32).fill('a').join(''),
-      cookie: { secure: false }
+  const issuer = await Issuer.discover(keycloakUrl)
+
+  const client = new issuer.Client({
+    client_id: opts.clientId,
+    client_secret: opts.clientSecret
+  })
+
+  fastify.register(cookie)
+
+  fastify.register(session, {
+    secret: new Array(32).fill('a').join(''),
+    cookie: { secure: false }
+  })
+
+  fastify.register(
+    grant.fastify()({
+      defaults: {
+        origin: opts.appOrigin,
+        transport: 'session'
+      },
+      keycloak: {
+        key: opts.clientId,
+        secret: opts.clientSecret,
+        oauth: 2,
+        authorize_url: issuer.metadata.authorization_endpoint,
+        access_url: issuer.metadata.token_endpoint,
+        callback: '/',
+        scope: opts.scope ?? ['openid'],
+        nonce: true
+      }
     })
-
-    fastify.register(
-      grant.fastify()({
-        defaults: {
-          origin: opts.appOrigin,
-          transport: 'session'
-        },
-        keycloak: {
-          key: opts.clientId,
-          secret: opts.clientSecret,
-          oauth: 2,
-          authorize_url: config.authorization_endpoint,
-          access_url: config.token_endpoint,
-          callback: '/',
-          scope: opts.scope ?? ['openid'],
-          nonce: true
-        }
-      })
-    )
-  }
-
-  pipe(
-    keycloakConfiguration,
-    E.match(
-      (error) => {
-        fastify.log.fatal(`Failed to get openid-configuration: ${error}`)
-        throw new Error(`Failed to get openid-configuration: ${error}`)
-      },
-      (config) => {
-        registerDependentPlugin(config)
-      }
-    )
-  )
-
-  function getRealmResponse(url: string) {
-    return TE.tryCatch(
-      () => axios.get<RealmResponse>(url),
-      (e) => new Error(`${e}`)
-    )
-  }
-
-  const secretPublicKey = await pipe(
-    `${protocol}${opts.keycloakSubdomain}`,
-    getRealmResponse,
-    TE.map((response) => response.data),
-    TE.map((realmResponse) => realmResponse.public_key),
-    TE.map((publicKey) => `-----BEGIN PUBLIC KEY-----\n${publicKey}\n-----END PUBLIC KEY-----`)
-  )()
-
-  pipe(
-    secretPublicKey,
-    E.match(
-      (e) => {
-        fastify.log.fatal(`Failed to get public key: ${e}`)
-        throw new Error(`Failed to get public key: ${e}`)
-      },
-      (publicKey) => {
-        fastify.register(jwt, {
-          secret: {
-            private: 'dummyprivate',
-            public: publicKey
-          },
-          verify: { algorithms: ['RS256'] }
-        })
-      }
-    )
   )
 
   function getGrantFromSession(request: FastifyRequest): E.Either<Error, GrantSession> {
@@ -175,27 +112,20 @@ export default fastifyPlugin(async (fastify: FastifyInstance, opts: KeycloakOpti
     )
   }
 
-  function verifyIdtoken(idToken: string): E.Either<Error, string> {
-    return E.tryCatch(
-      () => fastify.jwt.verify(idToken),
-      (e) => new Error(`Failed to verify id_token: ${e}`)
+  function introspect(token: string) {
+    return TE.tryCatch(
+      () => client.introspect(token),
+      (error) => new Error(`Failed to introspect token: ${error}`)
     )
   }
 
-  function decodedTokenToJson(decodedToken: string): E.Either<Error, any> {
-    return E.tryCatch(
-      () => JSON.parse(JSON.stringify(decodedToken)),
-      (e) => new Error(`Failed to parsing json from decodedToken: ${e}`)
-    )
-  }
-
-  function authentication(request: FastifyRequest): E.Either<Error, any> {
+  function authentication(request: FastifyRequest): TE.TaskEither<Error, IntrospectionResponse> {
     return pipe(
       getGrantFromSession(request),
       E.chain(getResponseFromGrant),
       E.chain(getIdtokenFromResponse),
-      E.chain(verifyIdtoken),
-      E.chain(decodedTokenToJson)
+      TE.fromEither,
+      TE.chain(introspect)
     )
   }
 
@@ -204,13 +134,6 @@ export default fastifyPlugin(async (fastify: FastifyInstance, opts: KeycloakOpti
       request.headers.authorization,
       O.fromNullable,
       O.map((str) => str.substring(7))
-    )
-  }
-
-  function verifyJwtToken(token: string): E.Either<Error, string> {
-    return E.tryCatch(
-      () => fastify.jwt.verify(token),
-      (e) => new Error(`Failed to verify token: ${e}`)
     )
   }
 
@@ -233,34 +156,41 @@ export default fastifyPlugin(async (fastify: FastifyInstance, opts: KeycloakOpti
   )
 
   function authenticationByGrant(request: FastifyRequest, reply: FastifyReply) {
-    pipe(
+    return pipe(
       authentication(request),
-      E.fold(
+      TE.match(
         (e) => {
           request.log.debug(`${e}`)
-          reply.redirect(`${opts.appOrigin}/connect/keycloak`)
+          reply.redirect(grantUrl)
         },
-        (decodedJson) => {
-          request.session.user = userPayloadMapper(decodedJson)
-          request.log.debug(`${inspect(request.session.user, false, null)}`)
+        (response) => {
+          if (response.active) {
+            request.session.user = userPayloadMapper(response as any)
+            request.log.debug(`${inspect(request.session.user, false, null)}`)
+          } else {
+            reply.redirect(grantUrl)
+          }
         }
       )
     )
   }
 
   function authenticationByToken(request: FastifyRequest, reply: FastifyReply, bearerToken: string) {
-    pipe(
+    return pipe(
       bearerToken,
-      verifyJwtToken,
-      E.chain(decodedTokenToJson),
-      E.fold(
-        (e) => {
-          request.log.debug(`${e}`)
-          reply.status(401).send(`Unauthorized`)
+      introspect,
+      TE.match(
+        (error) => {
+          request.log.debug(`${error}`)
+          reply.status(500).send({ error })
         },
-        (decodedJson) => {
-          request.session.user = userPayloadMapper(decodedJson)
-          request.log.debug(`${inspect(request.session.user, false, null)}`)
+        (response) => {
+          if (response.active) {
+            request.session.user = userPayloadMapper(response as any)
+            request.log.debug(`${inspect(request.session.user, false, null)}`)
+          } else {
+            reply.status(401).send(`Unauthorized`)
+          }
         }
       )
     )
@@ -302,18 +232,22 @@ export default fastifyPlugin(async (fastify: FastifyInstance, opts: KeycloakOpti
       request,
       filterGrantRoute,
       O.chain(filterExcludedPattern),
-      O.map((request) =>
-        pipe(
-          request,
-          getBearerTokenFromRequest,
-          O.match(
-            () => authenticationByGrant(request, reply),
-            (bearerToken) => authenticationByToken(request, reply, bearerToken)
-          )
-        )
+      O.match(
+        () => {
+          done()
+        },
+        (request) => {
+          pipe(
+            request,
+            getBearerTokenFromRequest,
+            O.match(
+              () => authenticationByGrant(request, reply),
+              (bearerToken) => authenticationByToken(request, reply, bearerToken)
+            )
+          )().then(() => done())
+        }
       )
     )
-    done()
   })
 
   function logout(request: FastifyRequest, reply: FastifyReply) {
@@ -323,10 +257,7 @@ export default fastifyPlugin(async (fastify: FastifyInstance, opts: KeycloakOpti
         O.fromNullable,
         O.match(
           () => {
-            pipe(
-              keycloakConfiguration,
-              E.map((config) => reply.redirect(`${config.end_session_endpoint}?redirect_uri=${opts.appOrigin}`))
-            )
+            reply.redirect(`${issuer.metadata.end_session_endpoint}?redirect_uri=${opts.appOrigin}`)
           },
           (e) => {
             request.log.error(`Failed to logout: ${e}`)
